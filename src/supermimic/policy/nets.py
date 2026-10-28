@@ -27,6 +27,8 @@ class PolicyCfg:
     goal_term_scale: tuple[float, ...] = (1.0, 5.0, 1.0, 2.0, 1.0, 1.0)
     decoder_last_gain: float = 0.01
     goal_dim: int = GOAL_DIM  # 680 (+9 with anchor_obs)
+    velocity_encoder: bool = False  # Opt in without changing legacy motion checkpoints/optimizers.
+    velocity_term_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
 
 
 @dataclass
@@ -59,6 +61,24 @@ class MotionEncoder(nn.Module):
         return torch.tanh(self.mlp(goal * self.scale))
 
 
+class VelocityEncoder(nn.Module):
+    """Encode proprioceptive history and heading-frame (vx, vy, wz) into z_vel."""
+
+    def __init__(self, cfg: PolicyCfg):
+        super().__init__()
+        obs_dim = sum(d for _, d in OBS_TERMS) * cfg.history
+        self.mlp = MLP(obs_dim + 3, cfg.encoder_hidden, cfg.latent_dim)
+        self.register_buffer("obs_scale", _obs_scale_vector(cfg))
+        scale = torch.tensor(cfg.velocity_term_scale, dtype=torch.float32)
+        if scale.shape != (3,) or not torch.isfinite(scale).all() or (scale <= 0).any():
+            raise ValueError("velocity_term_scale must contain three finite positive values")
+        self.register_buffer("command_scale", scale.reciprocal())
+
+    def forward(self, obs_hist: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+        inputs = torch.cat([obs_hist * self.obs_scale, command * self.command_scale], dim=-1)
+        return torch.tanh(self.mlp(inputs))
+
+
 class Decoder(nn.Module):
     def __init__(self, cfg: PolicyCfg, obs_dim: int = 930):
         super().__init__()
@@ -70,16 +90,24 @@ class Decoder(nn.Module):
 
 
 class Policy(nn.Module):
-    """a = dec(enc_motion(g), o_hist). Extra goal interfaces can be registered later (plan Appendix B)."""
+    """Motion or optional velocity encoder feeding the same decoder, one latent at a time."""
 
     def __init__(self, cfg: PolicyCfg):
         super().__init__()
         self.cfg = cfg
         self.encoders = nn.ModuleDict({"motion": MotionEncoder(cfg)})
         self.decoder = Decoder(cfg)
+        if cfg.velocity_encoder:
+            self.encoders["velocity"] = VelocityEncoder(cfg)
 
     def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, interface: str = "motion") -> torch.Tensor:
-        return self.decoder(self.encoders[interface](goal), obs_hist)
+        if interface == "velocity":
+            if "velocity" not in self.encoders:
+                raise ValueError("Enable PolicyCfg.velocity_encoder to use the velocity interface")
+            z = self.encoders["velocity"](obs_hist, goal)
+        else:
+            z = self.encoders[interface](goal)
+        return self.decoder(z, obs_hist)
 
 
 class Critic(nn.Module):

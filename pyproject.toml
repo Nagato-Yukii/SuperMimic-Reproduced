@@ -19,6 +19,7 @@ dependencies = [
   "huggingface-hub>=0.30",
   "pandas",
   "pyarrow",
+  "pyyaml>=6.0",
   "tqdm",
 ]
 

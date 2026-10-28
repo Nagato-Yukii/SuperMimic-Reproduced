@@ -1,0 +1,17 @@
+# Mixed motion tracking + RL velocity interface. No training is launched by this file.
+task: motion
+run_name: motion_velocity_lafan1
+data:
+  npz_dir: data/npz/lafan_w_velocity
+env:
+  num_envs: 4096
+  anchor_obs: false
+policy:
+  velocity_encoder: true
+wm_trainer:
+  batch_size: 1024
+policy_trainer:
+  batch_size: 512  # 256 motion + 256 velocity imagined rollouts
+schedule:
+  checkpoint_interval: 1000
+initialize_from: logs/motion_lafan1/ckpt_latest.pt

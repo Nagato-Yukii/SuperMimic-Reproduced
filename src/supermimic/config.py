@@ -50,6 +50,7 @@ class ScheduleCfg:
 
 @dataclass
 class TrainConfig:
+    task: str = "motion"
     run_name: str = "debug"
     log_root: Path = Path("logs")
     seed: int = 0
@@ -62,4 +63,5 @@ class TrainConfig:
     critic: CriticCfg = field(default_factory=CriticCfg)
     policy_trainer: PolicyTrainerCfg = field(default_factory=PolicyTrainerCfg)
     schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
+    initialize_from: Path | None = None  # Load learned weights into a new run (no optimizer/schedule resume).
     resume: Path | None = None

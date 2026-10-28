@@ -24,6 +24,7 @@ class WindowBatch:
     reward: torch.Tensor  # (k, n)
     done: torch.Tensor  # (k, n) termination label of states 1..k
     frame: torch.Tensor  # (k, n) target frame of each transition
+    command: torch.Tensor | None = None  # (k, n, C) for command-based tasks
 
 
 @dataclass
@@ -34,18 +35,20 @@ class StartBatch:
     prev_action: torch.Tensor  # (n, A) clean action of the previous step (0 at episode start)
     hist_states: torch.Tensor  # (hist, n, S) states s_{t-hist+1..t} (backfilled at episode start)
     hist_actions: torch.Tensor  # (hist, n, A) clean actions a_{t-hist..t-1} aligned with hist_states' obs
+    command: torch.Tensor | None = None  # (n, C) for command-based tasks
 
 
 class ReplayBuffer:
-    def __init__(self, num_envs: int, capacity: int, state_dim: int, act_dim: int, xi_dim: int, device):
+    def __init__(self, num_envs: int, capacity: int, state_dim: int, act_dim: int, xi_dim: int, device, command_dim: int = 0):
         self.E, self.T = num_envs, capacity
         self.device = torch.device(device)
         E, T = num_envs, capacity
-        f = lambda *shape: torch.zeros(E, T, *shape, device=self.device)  # noqa: E731
+        f = lambda *shape: torch.zeros(E, T, *shape, device=self.device)
         self.s = f(state_dim)
         self.a = f(act_dim)
         self.a_exec = f(act_dim)
         self.xi = f(xi_dim)
+        self.command = f(command_dim) if command_dim else None
         self.r = f()
         self.done = f()
         self.frame = torch.zeros(E, T, dtype=torch.long, device=self.device)
@@ -62,12 +65,16 @@ class ReplayBuffer:
     # ------------------------------------------------------------------ writes
 
     @torch.no_grad()
-    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start) -> None:
+    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start, command=None) -> None:
         p = self.ptr[env_ids]
         self.s[env_ids, p] = s
         self.a[env_ids, p] = a
         self.a_exec[env_ids, p] = a_exec
         self.xi[env_ids, p] = xi
+        if self.command is not None:
+            if command is None:
+                raise ValueError("command is required for a command-based replay buffer")
+            self.command[env_ids, p] = command
         self.r[env_ids, p] = r
         self.done[env_ids, p] = done
         self.frame[env_ids, p] = frame
@@ -134,14 +141,19 @@ class ReplayBuffer:
             reward=self.r[ee[:-1], tt[:-1]],
             done=self.done[ee[1:], tt[1:]],
             frame=self.frame[ee[:-1], tt[:-1]],
+            command=self.command[ee[:-1], tt[:-1]] if self.command is not None else None,
         )
 
     @torch.no_grad()
-    def sample_starts(self, n: int, hist: int) -> StartBatch:
+    def sample_starts(self, n: int, hist: int, env_slice: slice | None = None) -> StartBatch:
         mask = self.valid & ~self.terminal
         t_idx = torch.arange(self.T, device=self.device)[None, :]
         dist_to_ptr = (self.ptr[:, None] - t_idx - 1) % self.T
         mask &= dist_to_ptr < self.T - hist - 1  # keep history rows from being overwritten underneath
+        if env_slice is not None:
+            allowed = torch.zeros(self.E, dtype=torch.bool, device=self.device)
+            allowed[env_slice] = True
+            mask &= allowed[:, None]
         e, t = self._sample_from_mask(mask, n)
         offs = torch.arange(hist, device=self.device) - (hist - 1)  # -(hist-1) .. 0
         tt = (t[None, :] + offs[:, None]) % self.T  # (hist, n)
@@ -164,4 +176,5 @@ class ReplayBuffer:
             prev_action=hist_actions[-1],
             hist_states=hist_states,
             hist_actions=hist_actions,
+            command=self.command[e, t] if self.command is not None else None,
         )

@@ -101,6 +101,7 @@ class MotionLibrary:
         start = 0
         body_idx = root_idx = None
         ref_chunks: list[np.ndarray] = []
+        velocity_chunks = []
         body_chunks = {"pos": [], "quat": [], "lin": [], "ang": []}
         # A single packed cache (build_library.py) can stand in for the npz list (compact mode only).
         if len(npz_files) == 1 and str(npz_files[0]).endswith(".pt"):
@@ -122,6 +123,11 @@ class MotionLibrary:
                     [bp[:, root_idx], bq[:, root_idx], d["joint_pos"], blv[:, root_idx], bav[:, root_idx], d["joint_vel"]], axis=1
                 ).astype(np.float32)
                 ref_chunks.append(ref)
+                if "velocity_command" in d:
+                    velocity_chunks.append(d["velocity_command"].astype(np.float32))
+                else:
+                    from supermimic.data.heading_velocity import heading_velocity
+                    velocity_chunks.append(heading_velocity(bp[:, root_idx], bq[:, root_idx], float(d['fps'].reshape(-1)[0])))
                 if not compact:
                     body_chunks["pos"].append(bp[:, body_idx])
                     body_chunks["quat"].append(bq[:, body_idx])
@@ -129,6 +135,8 @@ class MotionLibrary:
                     body_chunks["ang"].append(bav[:, body_idx])
             clips.append(ClipInfo(Path(f).stem, start, n))
             start += n
+        self.velocity_commands = (torch.as_tensor(np.concatenate(velocity_chunks), device=self.device, dtype=torch.float32)
+                                  if velocity_chunks else None)
         self.clips = clips
         self.num_clips = len(clips)
         self.num_frames = start

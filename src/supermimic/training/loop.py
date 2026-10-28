@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -28,6 +29,9 @@ from supermimic.world_model.world_model import WorldModel
 class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
+        cfg.world_model.velocity_enabled = cfg.policy.velocity_encoder
+        if cfg.policy.velocity_encoder and (cfg.env.num_envs < 2 or cfg.policy_trainer.batch_size < 2 or cfg.env.num_envs % 2 or cfg.policy_trainer.batch_size % 2):
+            raise ValueError("Mixed interfaces require even num_envs and policy batch_size")
         cfg.policy.goal_dim = cfg.env.future_frames * 68 + (9 if cfg.env.anchor_obs else 0)
         cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
         self.rank, local_rank, self.world = init_distributed()
@@ -67,6 +71,7 @@ class Trainer:
                 replay_capacity=cfg.env.replay_capacity,
                 compact_library=cfg.env.compact_library,
                 anchor_obs=cfg.env.anchor_obs,
+                velocity_enabled=cfg.policy.velocity_encoder,
                 seed=cfg.seed + 1000 * self.rank,
             ),
             device=self.device,
@@ -87,6 +92,16 @@ class Trainer:
             broadcast_params(m)
         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
         self.policy_trainer = PolicyTrainer(self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer)
+        self.velocity_trainer = None
+        self.velocity_stats = None
+        if cfg.policy.velocity_encoder:
+            from supermimic.velocity.trainer import VelocityCritic, VelocityTrainer
+            from supermimic.velocity.metrics import VelocityMetrics
+            self.velocity_stats = VelocityMetrics(self.device)
+            self.command.velocity_stats = self.velocity_stats
+            self.velocity_critic = VelocityCritic(cfg.critic.hidden).to(self.device)
+            broadcast_params(self.velocity_critic)
+            self.velocity_trainer = VelocityTrainer(self.wm,self.policy,self.velocity_critic,self.lib,cfg.policy_trainer)
         n_params = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
         if self.is_main:
             print(f"[INFO] params: world model {n_params(self.wm)/1e6:.2f}M, policy {n_params(self.policy)/1e6:.2f}M, critic {n_params(self.critic)/1e6:.3f}M")
@@ -95,9 +110,15 @@ class Trainer:
         self.ep_reward_sum = torch.zeros(env.num_envs, device=self.device)
         self.ep_len = torch.zeros(env.num_envs, device=self.device)
         self.max_step_reward = heads.reward_cfg.max_step_reward
+        if cfg.policy.velocity_encoder:
+            self.max_step_reward = torch.where(self.command.velocity_mask, .08, self.max_step_reward)
         self.iteration = 0
         self.num_updates = 0
         self._utd_acc = 0.0
+        if cfg.initialize_from is not None:
+            if cfg.resume is not None:
+                raise ValueError("Choose initialize_from or resume, not both")
+            self.initialize_from(cfg.initialize_from)
         if cfg.resume is not None:
             self.load(cfg.resume)
 
@@ -106,8 +127,14 @@ class Trainer:
     def save(self, name: str = "ckpt_latest.pt") -> None:
         if not self.is_main:
             return
+        velocity_state = {} if self.velocity_trainer is None else {
+            "velocity_critic": self.velocity_critic.state_dict(),
+            "velocity_opt": self.velocity_trainer.opt.state_dict(),
+            "velocity_critic_opt": self.velocity_trainer.critic_opt.state_dict(),
+        }
         torch.save(
             {
+                **velocity_state,
                 "iteration": self.iteration,
                 "num_updates": self.num_updates,
                 "wm": self.wm.state_dict(),
@@ -123,6 +150,19 @@ class Trainer:
             self.log_dir / name,
         )
 
+    def initialize_from(self, path: Path) -> None:
+        """Warm-start a new mixed run, explicitly allowing only new velocity weights."""
+        ck = torch.load(path, map_location=self.device, weights_only=False)
+        for module, key, allowed in ((self.wm, "wm", "velocity_term_head."),
+                                     (self.policy, "policy", "encoders.velocity.")):
+            result = module.load_state_dict(ck[key], strict=False)
+            if result.unexpected_keys or any(not k.startswith(allowed) for k in result.missing_keys):
+                raise ValueError(f"Incompatible {key} initialization: {result}")
+        self.critic.load_state_dict(ck["critic"])
+        if self.velocity_trainer is not None and "velocity_critic" in ck:
+            self.velocity_critic.load_state_dict(ck["velocity_critic"])
+        print(f"[INFO] initialized weights from {path}; new optimizers and schedule")
+
     def load(self, path: Path) -> None:
         ck = torch.load(path, map_location=self.device, weights_only=False)
         self.wm.load_state_dict(ck["wm"])
@@ -131,6 +171,10 @@ class Trainer:
         self.wm_trainer.opt.load_state_dict(ck["wm_opt"])
         self.policy_trainer.opt.load_state_dict(ck["policy_opt"])
         self.policy_trainer.critic_opt.load_state_dict(ck["critic_opt"])
+        if self.velocity_trainer is not None:
+            self.velocity_critic.load_state_dict(ck["velocity_critic"])
+            self.velocity_trainer.opt.load_state_dict(ck["velocity_opt"])
+            self.velocity_trainer.critic_opt.load_state_dict(ck["velocity_critic_opt"])
         self.command.bin_return.copy_(ck["bin_return"])
         self.command.bin_memory.copy_(ck["bin_memory"])
         self.iteration = ck["iteration"]
@@ -141,7 +185,13 @@ class Trainer:
 
     @torch.no_grad()
     def act(self, obs) -> torch.Tensor:
-        return self.policy(obs["policy"], obs["goal"])
+        if not self.cfg.policy.velocity_encoder:
+            return self.policy(obs["policy"], obs["goal"])
+        half = self.env.num_envs//2
+        return torch.cat([
+            self.policy(obs["policy"][:half],obs["goal"][:half]),
+            self.policy(obs["policy"][half:],self.command.velocity_command[half:],interface="velocity"),
+        ])
 
     def run(self) -> None:
         cfg = self.cfg
@@ -149,7 +199,7 @@ class Trainer:
         env = self.env
         obs, _ = env.reset()
         t_start = time.time()
-        timers = {"sim": 0.0, "wm": 0.0, "policy": 0.0}
+        timers = {"sim": 0.0, "wm": 0.0, "policy": 0.0, "velocity": 0.0}
         agg: dict[str, float] = {}
         agg_n = 0
         finished_returns: list[float] = []
@@ -167,7 +217,7 @@ class Trainer:
             if done.any():
                 ids = done.nonzero().squeeze(-1)
                 lens = self.ep_len[ids]
-                norm_ret = self.ep_reward_sum[ids] / (self.max_step_reward * lens.clamp_min(1))
+                norm_ret = self.ep_reward_sum[ids] / ((self.max_step_reward[ids] if torch.is_tensor(self.max_step_reward) else self.max_step_reward) * lens.clamp_min(1))
                 finished_returns.extend(norm_ret.tolist())
                 finished_lens.extend(lens.tolist())
                 self.ep_reward_sum[ids] = 0.0
@@ -181,9 +231,13 @@ class Trainer:
                 self._utd_acc += sch.updates_per_env_step
                 while self._utd_acc >= 1.0:
                     self._utd_acc -= 1.0
+                    if self.num_updates == 0 and self.is_main:
+                        print("[INFO] first training update: compiling enabled kernels may take several minutes; subsequent updates reuse them", flush=True)
                     lr = cosine_lr(self.iteration, sch.total_iterations, cfg.wm_trainer.lr, sch.lr_final_ratio, sch.lr_decay_fraction)
                     self.wm_trainer.set_lr(lr)
                     self.policy_trainer.set_lr(lr * cfg.policy_trainer.lr / cfg.wm_trainer.lr)
+                    if self.velocity_trainer is not None:
+                        self.velocity_trainer.set_lr(lr * cfg.policy_trainer.lr / cfg.wm_trainer.lr)
                     t0 = time.perf_counter()
                     m_wm = self.wm_trainer.update(self.buffer)
                     torch.cuda.synchronize()
@@ -191,6 +245,10 @@ class Trainer:
                     t0 = time.perf_counter()
                     for _ in range(sch.policy_updates_per_wm_update):
                         m_pi = self.policy_trainer.update(self.buffer)
+                        if self.velocity_trainer is not None:
+                            velocity_t0 = time.perf_counter()
+                            m_pi.update(self.velocity_trainer.update(self.buffer))
+                            timers["velocity"] += time.perf_counter() - velocity_t0
                     torch.cuda.synchronize()
                     timers["policy"] += time.perf_counter() - t0
                     self.num_updates += 1
@@ -205,6 +263,11 @@ class Trainer:
             if self.iteration % sch.log_interval == 0:
                 it = self.iteration
                 elapsed = time.time() - t_start
+                velocity_stats = self.velocity_stats.flush() if self.velocity_stats is not None else {}
+                if self.is_main:
+                    for name, value in velocity_stats.items():
+                        if math.isfinite(value):
+                            self.writer.add_scalar(f"velocity_sim/{name}", value, it)
                 if self.world > 1:
                     # Every rank must issue the same collectives: reduce (sum, count) unconditionally.
                     tot = allreduce_mean(float(sum(finished_returns))) * self.world
@@ -249,9 +312,20 @@ class Trainer:
                         f"train_ret {tr:.3f} (n={n_finished}) | "
                         f"wm nse1 {agg.get('wm/nse_1step', float('nan'))/max(agg_n,1):.4f} nse8 {(float(err[-1]) if err is not None else float('nan')):.4f} | "
                         f"imag_ret {agg.get('policy/imag_return_undisc', float('nan'))/max(agg_n,1):.3f} surv {agg.get('policy/imag_survival_H', float('nan'))/max(agg_n,1):.3f} | "
-                        f"t sim/wm/pi {timers['sim']:.1f}/{timers['wm']:.1f}/{timers['policy']:.1f}s"
+                        f"t sim/wm/pi {timers['sim']:.1f}/{timers['wm']:.1f}/{timers['policy']:.1f}s (velocity {timers['velocity']:.1f}s)"
                     )
                     print(msg, flush=True)
+                    if velocity_stats:
+                        v = velocity_stats
+                        print(
+                            f"  vel_sim MAE vx/vy/wz {v['all/vx_mae']:.3f}/{v['all/vy_mae']:.3f}/{v['all/wz_mae']:.3f} (m/s,m/s,rad/s) | "
+                            f"xy_err ref/rand/zero {v['reference/xy_error']:.3f}/{v['random/xy_error']:.3f}/{v['zero/xy_error']:.3f} m/s | "
+                            f"wz_err ref/rand/zero {v['reference/wz_mae']:.3f}/{v['random/wz_mae']:.3f}/{v['zero/wz_mae']:.3f} rad/s | "
+                            f"track_score xy/wz {v['all/linear_score']:.3f}/{v['all/yaw_score']:.3f} | "
+                            f"falls/1k_steps {v['all/falls_per_1k_steps']:.2f} | "
+                            f"vel_imag_reward {agg.get('policy/velocity/reward', float('nan'))/max(agg_n,1):.4f} | "
+                            f"align {agg.get('policy/velocity/alignment', float('nan'))/max(agg_n,1):.4f}", flush=True)
+
                 agg, agg_n = {}, 0
                 finished_returns, finished_lens = [], []
                 timers = {k: 0.0 for k in timers}

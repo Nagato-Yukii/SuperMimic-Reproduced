@@ -1,0 +1,15 @@
+# Default motion tracking architecture, observations, objectives and schedule.
+# Training batches reduced for the 16 GB RTX 5070 Ti shared with the desktop.
+task: motion
+run_name: motion_lafan1
+data:
+  npz_dir: data/npz/lafan1
+env:
+  num_envs: 4096
+  anchor_obs: false
+wm_trainer:
+  batch_size: 1024
+policy_trainer:
+  batch_size: 512
+schedule:
+  checkpoint_interval: 1000

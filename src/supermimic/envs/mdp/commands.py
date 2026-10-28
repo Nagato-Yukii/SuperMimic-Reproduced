@@ -59,6 +59,14 @@ class MultiClipMotionCommand(CommandTerm):
         lib = self.library
 
         n = self.num_envs
+        self.velocity_mask = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.velocity_metadata = torch.zeros(n, 5, device=self.device)
+        if cfg.velocity_enabled:
+            if n % 2:
+                raise ValueError("Mixed interfaces require an even number of environments")
+            if lib.velocity_commands is None:
+                raise ValueError("Velocity interfaces require NPZ motion data with velocity commands")
+            self.velocity_mask[n//2:] = True
         self.frame = torch.zeros(n, dtype=torch.long, device=self.device)
         self.clip_end = torch.zeros(n, dtype=torch.bool, device=self.device)
         self._refresh_ref()
@@ -88,6 +96,11 @@ class MultiClipMotionCommand(CommandTerm):
         """Cache the reference state / tracked-body states of the current target frames."""
         self._ref = self.library.ref(self.frame)
         self._bodies = self.library.bodies(self.frame)
+
+    @property
+    def velocity_command(self):
+        from supermimic.velocity.task import command_at
+        return command_at(self.velocity_metadata, self.library.velocity_commands[self.frame])
 
     @property
     def command(self) -> torch.Tensor:
@@ -207,6 +220,9 @@ class MultiClipMotionCommand(CommandTerm):
     def _finalize_episodes(self, env_ids: torch.Tensor) -> None:
         """Fold the finished episodes' discounted returns-to-go into the per-bin estimates."""
         cfg = self.cfg
+        if self.cfg.velocity_enabled:
+            self.ep_len[env_ids[self.velocity_mask[env_ids]]] = 0
+            env_ids = env_ids[~self.velocity_mask[env_ids]]
         lens = self.ep_len[env_ids]
         if lens.sum() == 0:
             return
@@ -290,6 +306,9 @@ class MultiClipMotionCommand(CommandTerm):
             self._finalize_episodes(env_ids)
         self.ep_len[env_ids] = 0
 
+        if self.cfg.velocity_enabled:
+            from supermimic.velocity.task import resample
+            resample(self.velocity_metadata, env_ids)
         sampled = self._sample_frames(len(env_ids))
         forced = self.forced_frame[env_ids]
         self.frame[env_ids] = torch.where(forced >= 0, forced, sampled)
@@ -346,6 +365,11 @@ class MultiClipMotionCommand(CommandTerm):
         if over.any():
             self.clip_end |= over
             self.frame = torch.where(over, last, self.frame)
+        if self.cfg.velocity_enabled and env_ids is None:
+            from supermimic.velocity.task import advance
+            reset = getattr(self._env, "reset_buf", torch.zeros_like(self.velocity_mask))
+            ids = (~reset).nonzero().flatten()
+            self.velocity_metadata[ids] = advance(self.velocity_metadata[ids])
         self._refresh_ref()
         self.update_relative_body_poses()
 
@@ -418,6 +442,7 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     memory_alpha: float = 0.01
     min_remaining_steps: int = 100
     max_logged_steps: int = 1024
+    velocity_enabled: bool = False
     compact_library: bool = False
     library_fp16: bool = True
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)

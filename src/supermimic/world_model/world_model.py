@@ -15,6 +15,7 @@ from supermimic.world_model.state_spec import StateSpec, StateSpecCfg
 
 @dataclass
 class WorldModelCfg:
+    velocity_enabled: bool = False
     hidden: tuple[int, ...] = (2048, 2048, 2048)
     term_hidden: tuple[int, ...] = (64, 64)
     state_spec: StateSpecCfg = field(default_factory=StateSpecCfg)
@@ -44,6 +45,8 @@ class WorldModel(nn.Module):
         self.spec = StateSpec(cfg.state_spec, device)
         self.dynamics = DynamicsMLP(hidden=cfg.hidden)
         self.term_head = TerminationHead(cfg.term_hidden, cfg.height_threshold, cfg.tilt_threshold)
+        if cfg.velocity_enabled:
+            self.velocity_term_head = MLP(2, cfg.term_hidden, 1)
         self.heads = heads  # analytic observation / reward / FK (no parameters)
         self.to(device)
 
@@ -60,6 +63,10 @@ class WorldModel(nn.Module):
         feats = self.heads.termination_features(s_next[..., 0:3], s_next[..., 3:7], ref)
         return self.term_head(feats)
 
+    def velocity_termination_logits(self, s):
+        from supermimic.velocity.task import termination_features
+        return self.velocity_term_head(termination_features(s)).squeeze(-1)
+
     # ------------------------------------------------------------------ Eq. 1
 
     def _loss_step(self, s, a, xi, s_true, done, ref_root_pos, ref_root_quat):
@@ -68,7 +75,17 @@ class WorldModel(nn.Module):
         e = self.spec.error_vector(s_next, s_true)
         feats = self.heads.termination_features(s_next[..., 0:3], s_next[..., 3:7], ReferenceFrame(None, None, None, None, ref_root_pos, ref_root_quat))
         logits = self.term_head(feats)
-        bce = F.binary_cross_entropy_with_logits(logits, done, reduction="none")
+        if self.cfg.velocity_enabled:
+            # Each head learns its own termination rule on the shared dynamics data.
+            from supermimic.velocity.task import terminated
+            true_feats = self.heads.termination_features(s_true[..., :3], s_true[..., 3:7], ReferenceFrame(None, None, None, None, ref_root_pos, ref_root_quat))
+            done = ((true_feats[..., 0].abs() > self.cfg.height_threshold) |
+                    (true_feats[..., 1].abs() > self.cfg.tilt_threshold)).float()
+            vel_logits = self.velocity_termination_logits(s_next)
+            vel_bce = F.binary_cross_entropy_with_logits(vel_logits, terminated(s_true).float(), reduction="none")
+        else:
+            vel_bce = 0.0
+        bce = F.binary_cross_entropy_with_logits(logits, done, reduction="none") + vel_bce
         return s_next, e * e, bce, logits
 
     def enable_compile(self, mode: str | None = "default") -> None:
@@ -99,7 +116,9 @@ class WorldModel(nn.Module):
                 if j == 0:
                     err_first = nse
                 err_last = nse
-                acc_num += ((logits > 0).float() == done[j]).float().mean()
+                labels = (self.heads.terminated(states[j + 1], refs[j], self.cfg.height_threshold, self.cfg.tilt_threshold).float()
+                          if self.cfg.velocity_enabled else done[j])
+                acc_num += ((logits > 0).float() == labels).float().mean()
         loss = total_state / k + self.cfg.term_loss_weight * total_term / k
         # Metrics stay on-device (detached tensors): a float() here would stall the CPU on the
         # forward pass every minibatch, which in data-parallel runs turns into lockstep waiting.

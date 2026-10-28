@@ -35,7 +35,8 @@ class ReplayRecorder(RecorderTerm):
         self.command_name = p.get("command_name", "motion")
         self.action_name = p.get("action_name", "joint_pos")
         n = env.num_envs
-        self.buffer = ReplayBuffer(n, int(p["capacity"]), STATE_DIM, 29, XI_DIM, env.device)
+        self.buffer = ReplayBuffer(n, int(p["capacity"]), STATE_DIM, 29, XI_DIM, env.device, command_dim=5 if p.get("velocity_enabled") else 0)
+        self.prev_command = torch.zeros(n, 5, device=env.device)
         self.prev_s = torch.zeros(n, STATE_DIM, device=env.device)
         self.prev_xi = torch.zeros(n, XI_DIM, device=env.device)
         self.prev_frame = torch.zeros(n, dtype=torch.long, device=env.device)
@@ -54,6 +55,7 @@ class ReplayRecorder(RecorderTerm):
 
     def _remember(self, ids: torch.Tensor) -> None:
         cmd = self.command
+        self.prev_command[ids] = cmd.velocity_metadata[ids]
         self.prev_s[ids] = self.state_io.read()[ids]
         self.prev_xi[ids] = self.ctx.read()[ids]
         self.prev_frame[ids] = cmd.frame[ids]
@@ -79,6 +81,7 @@ class ReplayRecorder(RecorderTerm):
             clip=self.prev_clip[ids],
             terminal=torch.zeros_like(done_next, dtype=torch.bool),
             ep_start=self.ep_start[ids],
+            command=self.prev_command[ids],
         )
         self.ep_start[ids] = False
 
@@ -95,6 +98,7 @@ class ReplayRecorder(RecorderTerm):
         self.buffer.add(
             env_ids,
             s=s_next,
+            command=self.prev_command[env_ids],
             a=zeros_a,
             a_exec=zeros_a,
             xi=self.prev_xi[env_ids],

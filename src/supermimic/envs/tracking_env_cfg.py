@@ -86,6 +86,7 @@ class SuperMimicEnvCfgArgs:
     root_tilt_threshold: float = 0.8
     joint_limit_weight: float = -2.0
     bin_frames: int = 50
+    velocity_enabled: bool = False
     compact_library: bool = False
     anchor_obs: bool = False  # add BeyondMimic anchor-relative pose (9) to the goal group (plan D5 alt.)
     debug_vis: bool = False  # draw the reference ghost in the viewer (scripts/play.py)
@@ -155,6 +156,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             joint_position_range=(-0.1, 0.1) if a.reset_noise else (0.0, 0.0),
             sampling_mode=a.sampling_mode,  # type: ignore[arg-type]
             compact_library=a.compact_library,
+            velocity_enabled=a.velocity_enabled,
             debug_vis=a.debug_vis,
             **a.extra_command_kwargs,
         )
@@ -220,9 +222,19 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         "root_tilt": TerminationTermCfg(func=sm_term.bad_root_tilt, params={"command_name": "motion", "threshold": a.root_tilt_threshold}),
     }
 
+    if a.velocity_enabled:
+        from supermimic.velocity.task import motion_only, sim_reward, sim_terminated
+        for term in rewards.values():
+            term.func, term.params = motion_only, {"func": term.func, "kwargs": term.params}
+        rewards["velocity"] = RewardTermCfg(func=sim_reward, weight=1.0)
+        for name in ("root_height", "root_tilt"):
+            term = terminations[name]
+            term.func, term.params = motion_only, {"func": term.func, "kwargs": term.params}
+        terminations["velocity_fall"] = TerminationTermCfg(func=sim_terminated)
+
     recorders = {}
     if a.record_transitions:
-        recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link"})
+        recorders["replay"] = ReplayRecorderCfg(params={"velocity_enabled": a.velocity_enabled, "capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link"})
 
     cfg = ManagerBasedRlEnvCfg(
         scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": get_g1_robot_cfg()}),

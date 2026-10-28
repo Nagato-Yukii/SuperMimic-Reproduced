@@ -3,9 +3,12 @@
   uv run sm-train --run-name e1_walk --data.clips walk1_subject1 --env.num-envs 1024
 """
 
+# ruff: noqa: I001  # CUDA visibility must be set before importing Tyro and training modules.
+
 from __future__ import annotations
 
 import os
+import sys
 
 # Under torchrun, pin each rank to its own GPU *before* CUDA/warp initialise: MuJoCo Warp and
 # mjlab's simulation always run on the first visible device, so cfg.device alone is not enough.
@@ -38,13 +41,16 @@ if "LOCAL_RANK" in os.environ and int(os.environ.get("LOCAL_WORLD_SIZE", "1")) <
 import tyro
 
 from supermimic.config import TrainConfig
+from supermimic.config_yaml import expand_config_args
 
 
 def main() -> None:
-    cfg = tyro.cli(TrainConfig)
-    from supermimic.training.loop import Trainer
-
-    Trainer(cfg).run()
+    cfg = tyro.cli(TrainConfig, args=expand_config_args(sys.argv[1:]))
+    if cfg.task == "motion":
+        from supermimic.training.loop import Trainer
+        Trainer(cfg).run()
+    else:
+        raise ValueError(f"unknown task: {cfg.task}")
 
 
 if __name__ == "__main__":

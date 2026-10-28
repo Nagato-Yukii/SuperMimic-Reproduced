@@ -40,7 +40,9 @@ class PolicyTrainerCfg:
 class PolicyTrainer:
     def __init__(self, wm: WorldModel, policy: Policy, critic: Critic, lib: MotionLibrary, cfg: PolicyTrainerCfg):
         self.wm, self.policy, self.critic, self.lib, self.cfg = wm, policy, critic, lib, cfg
-        self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=cfg.betas)
+        motion_params = list(policy.encoders["motion"].parameters()) + list(policy.decoder.parameters())
+        self.motion_params = motion_params
+        self.opt = torch.optim.Adam(motion_params, lr=cfg.lr, betas=cfg.betas)
         self.critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
         from supermimic.imagination.compiled import ImagStep
 
@@ -59,7 +61,9 @@ class PolicyTrainer:
 
     def update(self, buffer: ReplayBuffer, xi_norm_fn=None) -> dict[str, float]:
         cfg = self.cfg
-        start = buffer.sample_starts(cfg.batch_size, cfg.history)
+        mixed = self.policy.cfg.velocity_encoder
+        start = buffer.sample_starts(cfg.batch_size // 2 if mixed else cfg.batch_size, cfg.history,
+                                     slice(0, buffer.E//2) if mixed else None)
         xi_norm = self.wm.spec.normalize_xi(start.xi)
 
         # ---- actor: BPTT through the frozen world model ------------------------------------
@@ -75,9 +79,10 @@ class PolicyTrainer:
         loss = -J / cfg.horizon
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
-        allreduce_grads(self.policy)
-        gn = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.grad_clip_norm)
-        torch.nn.utils.clip_grad_value_(self.policy.parameters(), cfg.grad_clip_value)
+        allreduce_grads(self.policy.encoders["motion"])
+        allreduce_grads(self.policy.decoder)
+        gn = torch.nn.utils.clip_grad_norm_(self.motion_params, cfg.grad_clip_norm)
+        torch.nn.utils.clip_grad_value_(self.motion_params, cfg.grad_clip_value)
         self.opt.step()
         self.wm.requires_grad_(True)
         self.critic.requires_grad_(True)
